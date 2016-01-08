@@ -10,7 +10,9 @@ import (
 	"fmt"
 	"github.com/davecgh/go-spew/spew"
 	"github.com/k0kubun/pp"
+	"strconv"
 	"strings"
+	"sync"
 )
 
 type MExpr interface {
@@ -36,6 +38,11 @@ type MExprString struct {
 type MExprInteger struct {
 	MExprBase
 	Value int
+}
+
+type MExprReal struct {
+	MExprBase
+	Value float64
 }
 
 type MExprSymbol struct {
@@ -68,7 +75,7 @@ func (this *MExprNormal) String() string {
 	if hd == "CompoundExpression" {
 		return strings.Join(args, ";\n")
 	} else {
-		return hd + "[" + strings.Join(args, ",") + "]"
+		return hd + "[" + strings.Join(args, ", ") + "]"
 	}
 }
 
@@ -98,6 +105,32 @@ func (*MExprString) Length() int {
 }
 func (this *MExprString) String() string {
 	return "\"" + this.Value + "\""
+}
+
+func (*MExprInteger) Head() MExpr {
+	return &MExprSymbol{
+		Context: "System",
+		Name:    "Integer",
+	}
+}
+func (*MExprInteger) Length() int {
+	return 0
+}
+func (this *MExprInteger) String() string {
+	return strconv.Itoa(this.Value)
+}
+
+func (*MExprReal) Head() MExpr {
+	return &MExprSymbol{
+		Context: "System",
+		Name:    "Real",
+	}
+}
+func (*MExprReal) Length() int {
+	return 0
+}
+func (this *MExprReal) String() string {
+	return fmt.Sprint(this.Value)
 }
 
 func walkIdentList(v ast.Visitor, list []*ast.Ident) {
@@ -452,6 +485,330 @@ func (this *Generator) Visit(anode ast.Node) (w ast.Visitor) {
 			Arguments: []MExpr{},
 		}
 		return nil
+	case *ast.DeferStmt:
+		gen := &Generator{
+			Program: make(chan MExpr),
+		}
+		defer close(gen.Program)
+		go func() {
+			gen.Visit(node.Call)
+		}()
+		args := []MExpr{
+			<-gen.Program,
+		}
+		this.Program <- &MExprNormal{
+			MExprBase: MExprBase{
+				Position: node.Pos(),
+			},
+			Hd: &MExprSymbol{
+				MExprBase: MExprBase{
+					Position: node.Pos(),
+				},
+				Context: "Rasta",
+				Name:    "Defer",
+			},
+			Arguments: args,
+		}
+	case *ast.CallExpr:
+		gen := &Generator{
+			Program: make(chan MExpr),
+		}
+		defer close(gen.Program)
+		go func() {
+			gen.Visit(node.Fun)
+			for _, arg := range node.Args {
+				gen.Visit(arg)
+			}
+		}()
+		name := <-gen.Program
+		args := []MExpr{}
+		for range node.Args {
+			args = append(args, <-gen.Program)
+		}
+		this.Program <- &MExprNormal{
+			MExprBase: MExprBase{
+				Position: node.Pos(),
+			},
+			Hd:        name,
+			Arguments: args,
+		}
+	case *ast.AssignStmt:
+		genLhs := &Generator{
+			Program: make(chan MExpr),
+		}
+		genRhs := &Generator{
+			Program: make(chan MExpr),
+		}
+		defer close(genLhs.Program)
+		defer close(genRhs.Program)
+		go func() {
+			for _, nd := range node.Lhs {
+				genLhs.Visit(nd)
+			}
+		}()
+		go func() {
+			for _, nd := range node.Rhs {
+				genRhs.Visit(nd)
+			}
+		}()
+		lhs := []MExpr{}
+		rhs := []MExpr{}
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		go func() {
+			defer wg.Done()
+			for range node.Lhs {
+				lhs = append(lhs, <-genLhs.Program)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			for range node.Rhs {
+				rhs = append(rhs, <-genRhs.Program)
+			}
+		}()
+		wg.Wait()
+		if len(lhs) == 1 {
+			this.Program <- &MExprNormal{
+				MExprBase: MExprBase{
+					Position: node.Pos(),
+				},
+				Hd: &MExprSymbol{
+					MExprBase: MExprBase{
+						Position: node.Pos(),
+					},
+					Context: "Rasta",
+					Name:    "Set",
+				},
+				Arguments: append(lhs, rhs...),
+			}
+		} else {
+			this.Program <- &MExprNormal{
+				MExprBase: MExprBase{
+					Position: node.Pos(),
+				},
+				Hd: &MExprSymbol{
+					MExprBase: MExprBase{
+						Position: node.Pos(),
+					},
+					Context: "Rasta",
+					Name:    "Set",
+				},
+				Arguments: []MExpr{
+					&MExprNormal{
+						Hd: &MExprSymbol{
+							MExprBase: MExprBase{
+								Position: node.Pos(),
+							},
+							Context: "System",
+							Name:    "List",
+						},
+						Arguments: lhs,
+					},
+					&MExprNormal{
+						Hd: &MExprSymbol{
+							MExprBase: MExprBase{
+								Position: node.Pos(),
+							},
+							Context: "System",
+							Name:    "List",
+						},
+						Arguments: rhs,
+					},
+				},
+			}
+		}
+	case *ast.BinaryExpr:
+		gen := &Generator{
+			Program: make(chan MExpr),
+		}
+		defer close(gen.Program)
+		go func() {
+			gen.Program <- &MExprString{
+				MExprBase: MExprBase{
+					Position: node.OpPos,
+				},
+				Value: node.Op.String(),
+			}
+			gen.Visit(node.X)
+			gen.Visit(node.Y)
+		}()
+
+		args := []MExpr{
+			<-gen.Program,
+			<-gen.Program,
+			<-gen.Program,
+		}
+		this.Program <- &MExprNormal{
+			MExprBase: MExprBase{
+				Position: node.Pos(),
+			},
+			Hd: &MExprSymbol{
+				MExprBase: MExprBase{
+					Position: node.Pos(),
+				},
+				Context: "Rasta",
+				Name:    "BinaryExpr",
+			},
+			Arguments: args,
+		}
+	case *ast.UnaryExpr:
+		gen := &Generator{
+			Program: make(chan MExpr),
+		}
+		defer close(gen.Program)
+		go func() {
+			gen.Visit(node.X)
+		}()
+		args := []MExpr{
+			&MExprString{
+				MExprBase: MExprBase{
+					Position: node.OpPos,
+				},
+				Value: node.Op.String(),
+			},
+			<-gen.Program,
+		}
+		this.Program <- &MExprNormal{
+			MExprBase: MExprBase{
+				Position: node.Pos(),
+			},
+			Hd: &MExprSymbol{
+				MExprBase: MExprBase{
+					Position: node.Pos(),
+				},
+				Context: "Rasta",
+				Name:    "UnaryOperation",
+			},
+			Arguments: args,
+		}
+	case *ast.IfStmt:
+		gen := &Generator{
+			Program: make(chan MExpr),
+		}
+		defer close(gen.Program)
+		go func() {
+			gen.Visit(node.Cond)
+			gen.Visit(node.Body)
+			if node.Else != nil {
+				gen.Visit(node.Else)
+			} else {
+				gen.Program <- &MExprSymbol{
+					MExprBase: MExprBase{
+						Position: node.Pos(),
+					},
+					Context: "System",
+					Name:    "Null",
+				}
+			}
+		}()
+
+		args := []MExpr{
+			<-gen.Program,
+			<-gen.Program,
+			<-gen.Program,
+		}
+		this.Program <- &MExprNormal{
+			MExprBase: MExprBase{
+				Position: node.Pos(),
+			},
+			Hd: &MExprSymbol{
+				MExprBase: MExprBase{
+					Position: node.Pos(),
+				},
+				Context: "System",
+				Name:    "If",
+			},
+			Arguments: args,
+		}
+	case *ast.ExprStmt:
+		this.Program <- &MExprSymbol{
+			MExprBase: MExprBase{
+				Position: node.Pos(),
+			},
+			Context: "Rasta",
+			Name:    "ExprStmt",
+		}
+	case *ast.ReturnStmt:
+		var args []MExpr
+		gen := &Generator{
+			Program: make(chan MExpr),
+		}
+		defer close(gen.Program)
+		go func() {
+			for _, res := range node.Results {
+				gen.Visit(res)
+			}
+		}()
+		if len(node.Results) == 1 {
+			args = []MExpr{
+				<-gen.Program,
+			}
+		} else {
+			for range node.Results {
+				args = append(args, <-gen.Program)
+			}
+			args = []MExpr{
+				&MExprNormal{
+					MExprBase: MExprBase{
+						Position: node.Pos(),
+					},
+					Hd: &MExprSymbol{
+						MExprBase: MExprBase{
+							Position: node.Pos(),
+						},
+						Context: "System",
+						Name:    "List",
+					},
+					Arguments: args,
+				},
+			}
+		}
+		this.Program <- &MExprNormal{
+			MExprBase: MExprBase{
+				Position: node.Pos(),
+			},
+			Hd: &MExprSymbol{
+				MExprBase: MExprBase{
+					Position: node.Pos(),
+				},
+				Context: "Rasta",
+				Name:    "BinaryExpr",
+			},
+			Arguments: args,
+		}
+	case *ast.BasicLit:
+		if node.Kind == token.INT {
+			ii, err := strconv.Atoi(node.Value)
+			if err != nil {
+				panic(spew.Sdump("Cannot parse integer value ", node.Value))
+			}
+			this.Program <- &MExprInteger{
+				MExprBase: MExprBase{
+					Position: node.Pos(),
+				},
+				Value: ii,
+			}
+		} else {
+			this.Program <- &MExprString{
+				MExprBase: MExprBase{
+					Position: node.Pos(),
+				},
+				Value: "Unhandeled BasicLit",
+			}
+		}
+	case *ast.CompositeLit:
+		this.Program <- &MExprSymbol{
+			MExprBase: MExprBase{
+				Position: node.Pos(),
+			},
+			Context: "Rasta",
+			Name:    "CompositeLit",
+		}
+	default:
+		pp.Println(node)
+		panic(node)
 
 	}
 	//pp.Println(node)
@@ -474,6 +831,25 @@ const (
 func ParseBitcodeFile(name string) (Module, error) {
 	var buf C.LLVMMemoryBufferRef
 	var errmsg *C.char
+	var cfilename *C.char = C.CString(name)
+	defer C.free(unsafe.Pointer(cfilename))
+	result := C.LLVMCreateMemoryBufferWithContentsOfFile(cfilename, &buf, &errmsg)
+	if result != 0 {
+		err := errors.New(C.GoString(errmsg))
+		C.free(unsafe.Pointer(errmsg))
+		return Module{}, err
+	}
+
+	defer C.LLVMDisposeMemoryBuffer(buf)
+
+	var m Module
+	if C.LLVMParseBitcode2(buf, &m.C) == 0 {
+		return m, nil
+	}
+
+	err := errors.New(C.GoString(errmsg))
+	C.free(unsafe.Pointer(errmsg))
+	return Module{}, err
 }
 `
 
