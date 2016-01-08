@@ -1,19 +1,125 @@
 package main
 
 import (
-	_ "github.com/k0kubun/pp"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"io/ioutil"
+
+	_ "github.com/k0kubun/pp"
 	//_ "llvm.org/llvm/bindings/go/llvm"
 	"fmt"
-	"github.com/davecgh/go-spew/spew"
-	"github.com/k0kubun/pp"
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/abduld/rasta/cgo"
+	"github.com/davecgh/go-spew/spew"
+	"github.com/k0kubun/pp"
+	"os"
+	"path/filepath"
+	"runtime"
 )
+
+var ptrSizeMap = map[string]int64{
+	"386":      4,
+	"amd64":    8,
+	"arm":      4,
+	"arm64":    8,
+	"mips64":   8,
+	"mips64le": 8,
+	"ppc64":    8,
+	"ppc64le":  8,
+	"s390":     4,
+	"s390x":    8,
+}
+
+var intSizeMap = map[string]int64{
+	"386":      4,
+	"amd64":    8,
+	"arm":      4,
+	"arm64":    8,
+	"mips64":   8,
+	"mips64le": 8,
+	"ppc64":    8,
+	"ppc64le":  8,
+	"s390":     4,
+	"s390x":    4,
+}
+
+var nerrors int
+
+// Die with an error message.
+func fatalf(msg string, args ...interface{}) {
+	// If we've already printed other errors, they might have
+	// caused the fatal condition.  Assume they're enough.
+	if nerrors == 0 {
+		fmt.Fprintf(os.Stderr, msg+"\n", args...)
+	}
+	os.Exit(2)
+}
+
+func main() {
+	goarch := runtime.GOARCH
+	if s := os.Getenv("GOARCH"); s != "" {
+		goarch = s
+	}
+	ptrSize := ptrSizeMap[goarch]
+	if ptrSize == 0 {
+		fatalf("unknown ptrSize for $GOARCH %q", goarch)
+	}
+	intSize := intSizeMap[goarch]
+	if intSize == 0 {
+		fatalf("unknown intSize for $GOARCH %q", goarch)
+	}
+	p := &cgo.Package{
+		PtrSize: ptrSize,
+		IntSize: intSize,
+		CgoFlags: map[string][]string{
+			"CFLAGS": []string{
+				"-D__STDC_LIMIT_MACROS=1",
+			},
+			"LDFLAGS": []string{
+				"llvm-config --libdir",
+			},
+		},
+		GccOptions: []string{
+			"-D__STDC_LIMIT_MACROS=1",
+			"-D__STDC_CONSTANT_MACROS=1",
+			"-I/usr/local/include",
+			"-I/Users/abduld/Code/go/src/llvm.org/llvm/bindings/go/llvm",
+		},
+		Written: make(map[string]bool),
+	}
+
+	goFiles := []string{
+		"/Users/abduld/Code/go/src/llvm.org/llvm/bindings/go/llvm/target.go",
+		"/Users/abduld/Code/go/src/llvm.org/llvm/bindings/go/llvm/llvm_config.go",
+		"/Users/abduld/Code/go/src/llvm.org/llvm/bindings/go/llvm/ir.go",
+	}
+	//goFiles := []string{
+	//	"test_cgo.txt",
+	//}
+	fs := make([]*cgo.File, len(goFiles))
+	for i, input := range goFiles {
+		f := new(cgo.File)
+		f.ReadGo(input)
+		f.DiscardCgoDirectives()
+		fs[i] = f
+	}
+	// make sure that _obj directory exists, so that we can write
+	// all the output files there.
+	os.Mkdir("_obj", 0777)
+	objDir := "_obj"
+	objDir += string(filepath.Separator)
+	for i, input := range goFiles {
+		f := fs[i]
+		p.Translate(f)
+		p.PackagePath = f.Package
+		p.Record(f)
+		p.WriteOutput(f, input)
+	}
+}
 
 type MExpr interface {
 	Head() MExpr
@@ -816,7 +922,7 @@ func (this *Generator) Visit(anode ast.Node) (w ast.Visitor) {
 }
 
 const code = `
-package main
+package cgo
 
 import "C"
 import "errors"
@@ -853,7 +959,7 @@ func ParseBitcodeFile(name string) (Module, error) {
 }
 `
 
-func main() {
+func main2() {
 
 	const pth = `/Users/abduld/Code/go/src/llvm.org/llvm/bindings/go/llvm/analysis.go`
 	_, err := ioutil.ReadFile(pth)
