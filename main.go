@@ -1,13 +1,15 @@
 package main
 
 import (
-	"github.com/k0kubun/pp"
+	_ "github.com/k0kubun/pp"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"io/ioutil"
 	//_ "llvm.org/llvm/bindings/go/llvm"
 	"fmt"
+	"github.com/davecgh/go-spew/spew"
+	"github.com/k0kubun/pp"
 	"strings"
 )
 
@@ -62,7 +64,12 @@ func (this *MExprNormal) String() string {
 	for ii, elem := range this.Arguments {
 		args[ii] = elem.String()
 	}
-	return this.Hd.String() + "[" + strings.Join(args, ",") + "]"
+	hd := this.Hd.String()
+	if hd == "CompoundExpression" {
+		return strings.Join(args, ";\n")
+	} else {
+		return hd + "[" + strings.Join(args, ",") + "]"
+	}
 }
 
 func (*MExprSymbol) Head() MExpr {
@@ -75,6 +82,9 @@ func (*MExprSymbol) Length() int {
 	return 0
 }
 func (this *MExprSymbol) String() string {
+	if this.Context == "System" {
+		return this.Name
+	}
 	return this.Context + "`" + this.Name
 }
 func (*MExprString) Head() MExpr {
@@ -124,29 +134,47 @@ func (this *Generator) Visit(anode ast.Node) (w ast.Visitor) {
 	//	pp.Println(node.Text())
 	//case *ast.Package:
 	//	pp.Println(node)
+	case *ast.DeclStmt:
+		this.Visit(node.Decl)
 	case *ast.SelectorExpr:
 		gen := &Generator{
 			Program: make(chan MExpr),
 		}
 		defer close(gen.Program)
-
-		ast.Walk(gen, node.X)
-		ast.Walk(gen, node.Sel)
-		this.Program <- &MExprNormal{
-			MExprBase: MExprBase{
-				Position: node.Pos(),
-			},
-			Hd: &MExprSymbol{
+		go func() {
+			gen.Visit(node.X)
+			gen.Visit(node.Sel)
+		}()
+		x := <-gen.Program
+		sel := <-gen.Program
+		if x.String() == "C" {
+			this.Program <- &MExprNormal{
 				MExprBase: MExprBase{
 					Position: node.Pos(),
 				},
-				Context: "Rasta",
-				Name:    "GetField",
-			},
-			Arguments: []MExpr{
-				<-gen.Program,
-				<-gen.Program,
-			},
+				Hd: &MExprSymbol{
+					MExprBase: MExprBase{
+						Position: node.Pos(),
+					},
+					Context: "Rasta",
+					Name:    "C",
+				},
+				Arguments: []MExpr{sel},
+			}
+		} else {
+			this.Program <- &MExprNormal{
+				MExprBase: MExprBase{
+					Position: node.Pos(),
+				},
+				Hd: &MExprSymbol{
+					MExprBase: MExprBase{
+						Position: node.Pos(),
+					},
+					Context: "Rasta",
+					Name:    "GetField",
+				},
+				Arguments: []MExpr{x, sel},
+			}
 		}
 	case *ast.Ident:
 		this.Program <- &MExprSymbol{
@@ -156,13 +184,38 @@ func (this *Generator) Visit(anode ast.Node) (w ast.Visitor) {
 			Context: "System",
 			Name:    node.Name,
 		}
+	case *ast.StarExpr:
+		gen := &Generator{
+			Program: make(chan MExpr),
+		}
+		defer close(gen.Program)
+		go func() {
+			gen.Visit(node.X)
+		}()
+		this.Program <- &MExprNormal{
+			MExprBase: MExprBase{
+				Position: node.Pos(),
+			},
+			Hd: &MExprSymbol{
+				MExprBase: MExprBase{
+					Position: node.Pos(),
+				},
+				Context: "Rasta",
+				Name:    "Reference",
+			},
+			Arguments: []MExpr{
+				<-gen.Program,
+			},
+		}
 	case *ast.TypeSpec:
 		gen := &Generator{
 			Program: make(chan MExpr),
 		}
 		defer close(gen.Program)
-		ast.Walk(gen, node.Name)
-		ast.Walk(gen, node.Type)
+		go func() {
+			gen.Visit(node.Name)
+			gen.Visit(node.Type)
+		}()
 
 		this.Program <- &MExprNormal{
 			MExprBase: MExprBase{
@@ -173,12 +226,114 @@ func (this *Generator) Visit(anode ast.Node) (w ast.Visitor) {
 					Position: node.Pos(),
 				},
 				Context: "Rasta",
-				Name:    "DeclareType",
+				Name:    "Type",
 			},
 			Arguments: []MExpr{
 				<-gen.Program,
 				<-gen.Program,
 			},
+		}
+	case *ast.BlockStmt:
+		stmts := []MExpr{}
+		gen := &Generator{
+			Program: make(chan MExpr),
+		}
+		defer close(gen.Program)
+		go func() {
+			for _, stmt := range node.List {
+				gen.Visit(stmt)
+			}
+		}()
+		for range node.List {
+			stmts = append(stmts, <-gen.Program)
+		}
+		this.Program <- &MExprNormal{
+			MExprBase: MExprBase{
+				Position: node.Pos(),
+			},
+			Hd: &MExprSymbol{
+				MExprBase: MExprBase{
+					Position: node.Pos(),
+				},
+				Context: "System",
+				Name:    "CompoundExpression",
+			},
+			Arguments: stmts,
+		}
+	case *ast.FuncType:
+
+		this.Program <- &MExprNormal{
+			MExprBase: MExprBase{
+				Position: node.Pos(),
+			},
+			Hd: &MExprSymbol{
+				MExprBase: MExprBase{
+					Position: node.Pos(),
+				},
+				Context: "Rasta",
+				Name:    "List",
+			},
+			Arguments: []MExpr{},
+		}
+	case *ast.FuncDecl:
+
+		gen := &Generator{
+			Program: make(chan MExpr),
+		}
+		defer close(gen.Program)
+		go func() {
+			gen.Visit(node.Name)
+			gen.Visit(node.Type)
+			gen.Visit(node.Body)
+		}()
+		this.Program <- &MExprNormal{
+			MExprBase: MExprBase{
+				Position: node.Pos(),
+			},
+			Hd: &MExprSymbol{
+				MExprBase: MExprBase{
+					Position: node.Pos(),
+				},
+				Context: "Rasta",
+				Name:    "Function",
+			},
+			Arguments: []MExpr{
+				<-gen.Program,
+				<-gen.Program,
+				<-gen.Program,
+			},
+		}
+	case *ast.ValueSpec:
+
+		gen := &Generator{
+			Program: make(chan MExpr),
+		}
+		defer close(gen.Program)
+		go func() {
+			if len(node.Names) > 1 {
+				panic("Unexpected number of indentifiers for value spec")
+			}
+			for _, ident := range node.Names {
+				gen.Visit(ident)
+			}
+			gen.Visit(node.Type)
+		}()
+		args := []MExpr{
+			<-gen.Program,
+			<-gen.Program,
+		}
+		this.Program <- &MExprNormal{
+			MExprBase: MExprBase{
+				Position: node.Pos(),
+			},
+			Hd: &MExprSymbol{
+				MExprBase: MExprBase{
+					Position: node.Pos(),
+				},
+				Context: "Rasta",
+				Name:    "Value",
+			},
+			Arguments: args,
 		}
 	case *ast.ImportSpec:
 		var nm MExpr
@@ -219,6 +374,46 @@ func (this *Generator) Visit(anode ast.Node) (w ast.Visitor) {
 				nm,
 			},
 		}
+	case *ast.GenDecl:
+
+		gen := &Generator{
+			Program: make(chan MExpr),
+		}
+		defer close(gen.Program)
+		go func() {
+			for _, spec := range node.Specs {
+				gen.Visit(spec)
+			}
+		}()
+		for range node.Specs {
+
+			expr := <-gen.Program
+			name := "Declare"
+			if node.Tok == token.CONST {
+				name = "DeclareConstant"
+			} else if node.Tok == token.TYPE {
+				name = "DeclareType"
+			}
+			if node.Tok == token.IMPORT {
+				this.Program <- expr
+			} else {
+				this.Program <- &MExprNormal{
+					MExprBase: MExprBase{
+						Position: node.Pos(),
+					},
+					Hd: &MExprSymbol{
+						MExprBase: MExprBase{
+							Position: node.Pos(),
+						},
+						Context: "Rasta",
+						Name:    name,
+					},
+					Arguments: []MExpr{
+						expr,
+					},
+				}
+			}
+		}
 	case *ast.File:
 		this.Program <- &MExprNormal{
 			MExprBase: MExprBase{
@@ -240,12 +435,9 @@ func (this *Generator) Visit(anode ast.Node) (w ast.Visitor) {
 				},
 			},
 		}
-		walkDeclList(
-			&Generator{
-				Program: this.Program,
-			},
-			node.Decls,
-		)
+		for _, decl := range node.Decls {
+			this.Visit(decl)
+		}
 		this.Program <- &MExprNormal{
 			MExprBase: MExprBase{
 				Position: node.Pos(),
@@ -269,17 +461,21 @@ func (this *Generator) Visit(anode ast.Node) (w ast.Visitor) {
 const code = `
 package main
 
+import "C"
+import "errors"
 
 type VerifierFailureAction C.LLVMVerifierFailureAction
 
 const (
 	// verifier will print to stderr and abort()
 	AbortProcessAction VerifierFailureAction = C.LLVMAbortProcessAction
-	// verifier will print to stderr and return 1
-	PrintMessageAction VerifierFailureAction = C.LLVMPrintMessageAction
-	// verifier will just return 1
-	ReturnStatusAction VerifierFailureAction = C.LLVMReturnStatusAction
-)`
+	AbortProcessAction VerifierFailureAction = C.LLVMAbortProcessAction
+	)
+func ParseBitcodeFile(name string) (Module, error) {
+	var buf C.LLVMMemoryBufferRef
+	var errmsg *C.char
+}
+`
 
 func main() {
 
@@ -293,25 +489,28 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	done := make(chan bool)
+	done := make(chan bool, 1)
 	gen := &Generator{
 		Program: make(chan MExpr),
 	}
-	go func() {
-		ast.Walk(gen, f)
-		done <- true
-	}()
 
 	go func() {
-		for {
-			select {
-			case mexpr := <-gen.Program:
-				if mexpr != nil {
-					fmt.Println("E   ", mexpr)
-				}
-			}
-		}
+		gen.Visit(f)
+		done <- true
+
 	}()
-	<-done
-	pp.Println("Exit")
+	if false {
+		spew.Dump("dummy")
+		pp.Println("dummy")
+	}
+	for {
+		select {
+		case mexpr := <-gen.Program:
+			fmt.Println(mexpr)
+		case <-done:
+			//fmt.Println("Done")
+			return
+		}
+	}
+
 }
